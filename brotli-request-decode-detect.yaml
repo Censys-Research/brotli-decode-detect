@@ -1,0 +1,325 @@
+id: brotli-request-decode-detect
+
+info:
+  name: Brotli Request-Body Decoding Capability Detector (CVE-2026-111497 precondition)
+  author: broccoli-detector
+  severity: info
+  description: |
+    Detects whether an HTTP endpoint decodes `Content-Encoding: br` request bodies at all.
+    This is the precondition for the CVE-2026-111497 ("Node2Shell") class of bug in any
+    stack (Node, Python, .NET, Java, Go, Envoy, ...), since the Brotli library version is
+    not visible from a scan. It sends only RFC 7932-valid Brotli streams and never a
+    malformed one, so it cannot trigger the decoder bug: a patched and an unpatched decoder
+    behave identically on valid input. It answers "does this endpoint decode br", never
+    "is it vulnerable" or "is it patched" - that requires out-of-band version data.
+  remediation: |
+    This is a detection-only check, not a vulnerability confirmation. If the result is
+    ACTIVE, separately confirm the Brotli library/runtime version in use and patch if it
+    falls in the affected range (Brotli 1.0.3-1.2.0; Node.js < 22.23.4 / 24.22.1 / 26.12.1).
+  reference:
+    - https://nvd.nist.gov/vuln/detail/CVE-2026-111497
+  classification:
+    cve-id: CVE-2026-111497
+  metadata:
+    verified: true
+    max-request: 15
+  tags: cve,cve2026,nodejs,brotli,node2shell,detect,capability
+
+variables:
+  path: "/"
+
+javascript:
+  - pre-condition: |
+      (function () {
+        var explicit = parseInt(tport, 10);
+        var ports = explicit ? [explicit] : [443, 80];
+        for (var i = 0; i < ports.length; i++) {
+          try { if (isPortOpen(thost, ports[i])) return true; } catch (e) {}
+        }
+        return false;
+      })();
+
+    code: |
+      (function () {
+        const net = require("nuclei/net");
+
+        // Two valid JSON bodies; "bad" is just a different token, never malformed Brotli.
+        const OK = '{"probe":1}';
+        const BAD = '{"probe":';
+
+        // RFC 7932-valid Brotli streams, byte-exact verified against `brotli -d`.
+        // b_ok / b_bad: one uncompressed ("stored") meta-block wrapping OK / BAD.
+        const B_OK_HEX = "a000107b2270726f6265223a317d03";
+        const B_BAD_HEX = "8000107b2270726f6265223a03";
+        // b_decoy: decodes to BAD, but its wire bytes also contain OK inside a metadata
+        // meta-block (RFC 7932 section 9.2), which every compliant decoder skips. A server
+        // that reads wire bytes instead of decoded content (e.g. a lenient substring
+        // matcher, alone or behind a WAF) is fooled by this; a real decoder never is.
+        const B_DECOY_HEX = "2c057b2270726f6265223a317d4000087b2270726f6265223a03";
+        // n_ok: the same bytes as b_ok, but sent with no Content-Encoding header, so a
+        // server that ignores the header and parses raw bytes as JSON should fail on it.
+
+        const CTYPE = "application/json";
+        const UNTRUSTED = { 408: 1, 425: 1, 429: 1, 502: 1, 503: 1, 504: 1 };
+        const UA = "Mozilla/5.0 (compatible; brotli-capability-probe/1.0)";
+        const READ_LIMIT = 1 << 16;
+        const TIMEOUT = 10;
+
+        const TLS_PORTS = { 443: 1, 4443: 1, 8443: 1, 9443: 1, 10443: 1 };
+        const explicitPort = parseInt(tport, 10);
+        const candidates = explicitPort
+          ? [{ port: explicitPort, tls: TLS_PORTS[explicitPort] === 1 },
+             { port: explicitPort, tls: TLS_PORTS[explicitPort] !== 1 }]
+          : [{ port: 443, tls: true }, { port: 80, tls: false }];
+
+        // Candidate paths to try, in order: the user-supplied one first, then
+        // common POST endpoints. Handler-level decoders only run on real routes,
+        // so a single blind path would read NO SIGNAL for them (aiohttp, .NET,
+        // Netty, route-level express). First path whose plain pair shows body
+        // sensitivity wins; the rest are skipped.
+        const tpathOk = (typeof tpath === "string" && tpath.charAt(0) === "/");
+        const ROUTES = tpathOk
+          ? [tpath, "/echo", "/api", "/"]
+          : ["/echo", "/api", "/"];
+        let route = ROUTES[0];
+        
+        let transport = candidates[0];
+        let transportResolved = false;
+
+        // --- route discovery: plain valid/invalid pair per candidate path ---
+        function plainPair(r) {
+          const p_ok = send(null, null, OK);
+          const p_bad = send(null, null, BAD);
+          if (p_ok.error || p_bad.error) return null;
+          if (UNTRUSTED[p_ok.status] || UNTRUSTED[p_bad.status]) return null;
+          if (p_ok.status >= 500) return null;
+          // the route must really consume and parse the body: a 2xx plain response.
+          // (404 paths can still differ on body content without consuming it.)
+          if (p_ok.status < 200 || p_ok.status > 299) return null;
+          return (sig(p_ok) !== sig(p_bad)) ? { p_ok: p_ok, p_bad: p_bad } : null;
+        }
+        
+        let pair = null;
+        for (let i = 0; i < ROUTES.length; i++) {
+          route = ROUTES[i];
+          pair = plainPair();
+          if (pair) break; // this route consumed and parsed the body
+        }
+        if (!pair) {
+          return "brotli-decode: NO SIGNAL | no probed path showed body-sensitive parsing (tried " + ROUTES.join(",") + ")";
+        }
+        const p_ok = pair.p_ok;
+        const p_bad = pair.p_bad;
+        if (p_ok.error || p_bad.error) return "brotli-decode: INCONCLUSIVE | transport error on plain control";
+
+        function hostHeader() {
+          const bare = transport.port === (transport.tls ? 443 : 80);
+          return bare ? thost : thost + ":" + transport.port;
+        }
+
+        function parseResponse(raw) {
+          let s = raw;
+          while (/^HTTP\/1\.[01] 1\d\d/.test(s)) {
+            const cut = s.indexOf("\r\n\r\n");
+            if (cut < 0) return null;
+            s = s.substring(cut + 4);
+          }
+          const line = /^HTTP\/1\.[01] (\d{3})/.exec(s);
+          if (!line) return null;
+          const cut = s.indexOf("\r\n\r\n");
+          if (cut < 0) return { status: parseInt(line[1], 10), body: "", done: false };
+          const head = "\r\n" + s.substring(0, cut);
+          const body = s.substring(cut + 4);
+          const cl = /\r\ncontent-length:[ \t]*(\d+)/i.exec(head);
+          const chunked = /\r\ntransfer-encoding:[^\r\n]*chunked/i.test(head);
+          let done;
+          if (cl) done = body.length >= parseInt(cl[1], 10);
+          else if (chunked) done = body.indexOf("\r\n0\r\n\r\n") >= 0;
+          else done = false;
+          let out = body;
+          if (chunked && !cl) {
+            // strip chunked framing: "<size hex>\r\n<data>\r\n" ... "0\r\n"
+            let off = 0;
+            let out2 = "";
+            while (off < body.length) {
+              const nl = body.indexOf("\r\n", off);
+              if (nl < 0) { out2 += body.substring(off); break; }
+              const size = parseInt(body.substring(off, nl), 16);
+              if (isNaN(size)) { out2 += body.substring(off); break; }
+              off = nl + 2;
+              if (size === 0) break;
+              out2 += body.substring(off, off + size);
+              off += size + 2;
+            }
+            out = out2;
+          }
+          return { status: parseInt(line[1], 10), body: out, done: done };
+        }
+
+        // Mask hex/uuid runs and digit runs, same as the Ruby probe, so dynamic bodies
+        // (request ids, timestamps, counters) still compare equal across requests.
+        function normalize(body) {
+          const snippet = body.substring(0, 60).replace(/\s+/g, " ");
+          return snippet.replace(/[0-9a-f][0-9a-f-]{5,}/gi, "#").replace(/\d+/g, "#");
+        }
+
+        function attempt(contentEncoding, bodyHex, bodyText) {
+          const r = { error: null, status: null, norm: "" };
+          let conn = null;
+          try {
+            conn = transport.tls
+              ? net.OpenTLS("tcp", thost + ":" + transport.port)
+              : net.Open("tcp", thost + ":" + transport.port);
+          } catch (e) { r.error = "connect failed: " + e; return r; }
+
+          try {
+            conn.SetTimeout(TIMEOUT);
+            const bodyLen = bodyHex ? bodyHex.length / 2 : bodyText.length;
+            let head = "POST " + route + " HTTP/1.1\r\n" +
+                       "Host: " + hostHeader() + "\r\n" +
+                       "User-Agent: " + UA + "\r\n" +
+                       "Accept-Encoding: identity\r\n";
+            if (contentEncoding) head += "Content-Encoding: " + contentEncoding + "\r\n";
+            head += "Content-Type: " + CTYPE + "\r\n" +
+                    "Content-Length: " + bodyLen + "\r\n" +
+                    "Connection: close\r\n\r\n";
+            conn.Send(head);
+            if (bodyHex) conn.SendHex(bodyHex); else conn.Send(bodyText);
+
+            let raw = "";
+            for (let i = 0; i < 64; i++) {
+              let chunk = null;
+              try { chunk = conn.RecvString(8192); } catch (e) { break; }
+              if (!chunk || chunk.length === 0) break;
+              raw += chunk;
+              if (raw.length >= READ_LIMIT) break;
+              const partial = parseResponse(raw);
+              if (partial && partial.done) break;
+            }
+            const parsed = parseResponse(raw);
+            if (!parsed) r.error = "no HTTP response";
+            else { r.status = parsed.status; r.norm = normalize(parsed.body); }
+          } catch (e) { if (!r.error) r.error = "" + e; }
+
+          try { conn.Close(); } catch (e) {}
+          return r;
+        }
+
+        function send(contentEncoding, bodyHex, bodyText) {
+          if (transportResolved) return attempt(contentEncoding, bodyHex, bodyText);
+          let first = null;
+          const results = [];
+          for (let i = 0; i < candidates.length; i++) {
+            transport = candidates[i];
+            const r = attempt(contentEncoding, bodyHex, bodyText);
+            results.push(r);
+            if (r.status !== null && first === null) first = r;
+            if (i === 0 && r.status !== null && i + 1 < candidates.length) {
+              // A TLS port answering plain HTTP yields a synthetic 400 from the
+              // server ("sent plain HTTP to HTTPS port"). If the TLS candidate
+              // answers differently, it is the real transport.
+              transport = candidates[i + 1];
+              const r2 = attempt(contentEncoding, bodyHex, bodyText);
+              results.push(r2);
+              transport = candidates[i];
+              if (r2.status !== null && r2.status !== r.status) {
+                transportResolved = true;
+                transport = candidates[i + 1];
+                return r2;
+              }
+            }
+          }
+          transport = candidates[0];
+          transportResolved = true;
+          return first;
+        }
+
+        function sig(r) { return r.status + "|" + r.norm; }
+        function noSignal(status) {
+          return "brotli-decode: NO SIGNAL | response does not depend on body content (" + status + ")";
+        }
+
+        // --- core differential established above during route discovery ---
+        // p_ok / p_bad already show body-sensitive parsing on `route`.
+
+        // --- br-declared valid / invalid / decoy, and undeclared-br bytes ---
+        const b_ok = send("br", B_OK_HEX, null);
+        const b_bad = send("br", B_BAD_HEX, null);
+        const b_decoy = send("br", B_DECOY_HEX, null);
+        const n_ok = send(null, B_OK_HEX, null);
+        const p_ok2 = send(null, null, OK);
+        const core = [b_ok, b_bad, b_decoy, n_ok, p_ok2];
+        if (core.some(r => r.error)) {
+          return "brotli-decode: INCONCLUSIVE | transport error on a core request";
+        }
+        if (core.some(r => UNTRUSTED[r.status])) {
+          return "brotli-decode: INCONCLUSIVE | untrusted status (rate limit or gateway noise)";
+        }
+        if (sig(p_ok2) !== sig(p_ok)) {
+          return "brotli-decode: INCONCLUSIVE | unstable: the repeated plain request answered differently";
+        }
+        if (b_ok.status >= 500 || n_ok.status >= 500) {
+          return "brotli-decode: INCONCLUSIVE | 5xx on a valid-body request (backend error, not a parse result)";
+        }
+
+        if (sig(b_ok) === sig(p_ok)) {
+          if (sig(b_bad) !== sig(p_bad)) {
+            return "brotli-decode: AMBIGUOUS | br valid body matched plain but br invalid body did not";
+          }
+          if (sig(b_decoy) !== sig(p_bad)) {
+            return "brotli-decode: AMBIGUOUS | server accepted wire bytes containing a valid token instead of the decoded (invalid) content";
+          }
+          if (sig(n_ok) === sig(p_ok)) {
+            return "brotli-decode: AMBIGUOUS | undeclared br bytes were accepted like a plain body; cannot attribute to decoding";
+          }
+
+          // Confirmation: repeat the decisive pair once more, reversed order. A limiter or
+          // flaky backend will not reproduce; a real decoder will.
+          const n_ok2 = send(null, B_OK_HEX, null);
+          const b_decoy2 = send("br", B_DECOY_HEX, null);
+          const b_bad2 = send("br", B_BAD_HEX, null);
+          const b_ok2 = send("br", B_OK_HEX, null);
+          const p_bad2 = send(null, null, BAD);
+          const p_ok3 = send(null, null, OK);
+          const again = [n_ok2, b_decoy2, b_bad2, b_ok2, p_bad2, p_ok3];
+          const reproduced = !again.some(r => r.error || UNTRUSTED[r.status] || r.status >= 500) &&
+            sig(p_ok3) === sig(p_ok) && sig(b_ok2) === sig(p_ok3) && sig(b_bad2) === sig(p_bad2) &&
+            sig(b_decoy2) === sig(p_bad2) && sig(n_ok2) !== sig(p_ok3);
+          if (!reproduced) {
+            return "brotli-decode: AMBIGUOUS | positive did not reproduce with requests reversed";
+          }
+
+          return "brotli-decode: ACTIVE | path=" + route +
+                 " | responses track decoded content (valid HTTP" + b_ok.status +
+                 ", invalid HTTP" + b_bad.status + "); undeclared bytes gave HTTP" + n_ok.status;
+        }
+
+        if (/content-encoding|unsupported|brotli|install/i.test(b_ok.norm) && !/content-encoding|unsupported|brotli/i.test(p_ok.norm)) {
+          return "brotli-decode: NOT ACTIVE | explicit br refusal (HTTP" + b_ok.status + ")";
+        }
+        if (p_ok.status < 200 || p_ok.status > 299) {
+          return "brotli-decode: INCONCLUSIVE | plain control was HTTP" + p_ok.status + ", path may not consume bodies";
+        }
+        if (sig(b_ok) === sig(n_ok)) {
+          return "brotli-decode: NOT ACTIVE | Content-Encoding ignored (br HTTP" + b_ok.status + " with or without header)";
+        }
+        return "brotli-decode: AMBIGUOUS | plain HTTP" + p_ok.status + ", br HTTP" + b_ok.status + ", undeclared HTTP" + n_ok.status;
+      })()
+
+    args:
+      thost: "{{Host}}"
+      tport: "{{Port}}"
+      tpath: "{{path}}"
+
+    extractors:
+      - type: regex
+        part: response
+        group: 1
+        regex:
+          - 'brotli-decode: (ACTIVE|NOT ACTIVE|AMBIGUOUS|INCONCLUSIVE|NO SIGNAL)'
+
+    matchers:
+      - type: word
+        words:
+          - "brotli-decode: ACTIVE"
+# digest: 490a00463044022069f4255119f50d2511d80ac772f5a6aab97ea6addbe2088d37abb090f717aaa9022071798a906b10c48dd74596607e2ef2649109cf41b5a0984769c94e2415b396ac:1d466269e684d4cd7e36a2c774c432a7
